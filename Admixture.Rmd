@@ -1,0 +1,685 @@
+---
+title: "admixture"
+author: "Estelle Chen"
+date: '`r Sys.Date()`'
+output: html_document
+---
+
+```{r setup, include = FALSE, message=FALSE}
+# Modify this setup code chunk to set options
+# or add extra packages etc if needed.
+# See the project instructions for more details
+# on what code to show, and where/how.
+
+# Set default code chunk options
+knitr::opts_chunk$set(
+  echo = TRUE,
+  eval = TRUE
+)
+
+library(ggplot2)
+library(patchwork)
+library(magrittr)
+theme_set(theme_bw())
+library(readxl)
+library(patchwork)
+suppressPackageStartupMessages(library(tidyverse))
+library(MASS)
+library(mvtnorm)
+library(MCMCpack)
+library(coda)
+library(DirichletReg)
+library(actuar)
+library(cubature)
+
+# To give the same random number sequence every time the document is knit:ed,
+# making it easier to discuss the specific numbers in the text:
+set.seed(12345L)
+```
+
+# Data
+
+```{r data, warning=FALSE, message=FALSE}
+# read original data
+df <- read_excel("Project data.xls")
+colnames(df)[1] = "Region"
+regions <- df$Region
+
+# replace " ", "/" and "-" with "_" in row and column names
+names(df) = gsub("[ , /, -]", "_", names(df))
+
+# African data
+afr <- df[5:10, ]
+R <- 6
+C <- 15
+y_rc <- afr[, 2:16]
+N_r <- afr[, 17]
+# frequency
+f_rc <- y_rc 
+for (c in 1:C) {
+  f_rc[, c] <- f_rc[, c] / N_r
+}
+
+# American data
+ame <- df[1:4, ]
+S <- 4
+y_sc <- ame[, 2:16]
+N_s <- ame[, 17]
+```
+
+# Model likelihood
+```{r model}
+# probability parameter vector for multinomial distribution in terms of alpha
+p_s_multinom <- function(alpha, s) {
+  p_s <- colSums(alpha*f_rc)
+  p_s
+}
+
+# pmf of y_s ~ multinomial(N_s, p_s)
+model <- function(alpha, s) {
+  y_s <- y_sc[s, ]
+  N <- N_s[s, 1]
+  p <- p_s_multinom(alpha, s)
+  
+  dmultinom(y_s, size = N, prob = p)
+}
+```
+
+# Prior and posterior of alpha
+
+```{r bayesian alpha, message=FALSE}
+# prior of alpha ~ Dir(1)
+prior_alpha <- function(alpha) {
+  ddirichlet(matrix(alpha, nrow = 1), numeric(R)+1)
+}
+
+# posterior of alpha
+posterior_alpha <- function(alpha, s) {
+  model(alpha, s) * prior_alpha(alpha)
+}
+```
+
+# MH algorithm for alpha
+
+```{r MH alpha}
+# define a function to sample alpha using MH algorithm
+MHalpha <- function(alpha_init, s, sigma2, I) {
+  #' inputs
+  #' alpha_init: initial alpha vector (length = R)
+  #'             last element = 1 - sum of first R-1 elements
+  #' s: which American region
+  #' sigma2: variance for the first R-1 elements of candidate alpha*
+  #'         covariance matrix for multivariate Normal proposal is sigma2*I_(R-1)
+  #' I: number of iterations
+  
+  # 1. select initial value
+  alpha_now <- alpha_init
+  R = length(alpha_init)  # dimension
+  alpha_out <- matrix(0, nrow = I, ncol = R)  # matrix to store all alpha samples
+  accept_num <- 0  # number of accepted candidates
+  neg_alpha <- 0  # number of negative alpha's not meeting constraints
+  
+  
+  # 2. for i = 1, ..., I, repeat:
+  for (i in 1:I) {
+    # a. draw a candidate from proposal
+    alpha_cand_before <- rmvnorm(n = 1,
+                                 mean = alpha_now[1:R-1], 
+                                 sigma = diag(sigma2, nrow = R-1))
+    alpha_cand_R <- 1 - sum(alpha_cand_before)
+    alpha_cand <- append(alpha_cand_before, c(alpha_cand_R))
+    
+    if (all(alpha_cand >= 0)) {  # constraints satisfied
+      # b. acceptance probability
+      # posterior of alpha^(i-1)
+      posterior_now <- posterior_alpha(alpha_now, s)
+      # posterior of candidate alpha*
+      posterior_cand <- posterior_alpha(alpha_cand, s)
+      # acceptance probability
+      P_accept <- min(posterior_cand / posterior_now, 1)
+
+      # c. generate u from U[0,1]
+      u <- runif(1)
+      
+      # d. accept / reject the candidate
+      if (u <= P_accept) {  
+        # if u < P_accept, accept alpha_cand and save alpha^i = alpha_cand
+        # else, reject alpha_cand and save alpha_now
+        alpha_now <- alpha_cand
+        accept_num <- accept_num + 1
+        posterior_now <- posterior_cand
+      } 
+    } else {  # constraints not met, reject
+      neg_alpha <- neg_alpha + 1
+    }
+    alpha_out[i, ] <- alpha_now  # store alpha for iteration i  
+  }
+  
+  #' return: 
+  #' matrix of alpha
+  #' acceptance rate over I iterations 
+  #' rate of negative alpha's over I iterations
+  list(alpha = alpha_out, accept_rate = accept_num/I, neg_alpha_rate = neg_alpha/I)
+}
+```
+
+# M-H for z
+
+## Prior and posterior of z
+
+```{r bayesian z}
+# prior of z, with each z_rs ~ Gamma(1,1) (likelihood)
+prior_z <- function(z) {
+  prod(dgamma(z, shape = 1, rate = 1))
+}
+
+# posterior of z
+posterior_z <- function(z, s) {
+  alpha <- z/sum(z)
+  model(alpha, s) * prior_z(z)
+}
+```
+
+## Random walk MH algorithm for z
+
+```{r MH z}
+# define a function to sample z using RW MH algorithm
+MHz <- function(z_init, s, sigma2, I) {
+  #' inputs
+  #' z_init: initial z vector (length = R)
+  #' s: which American region
+  #' sigma2: variance for the elements of candidate z*
+  #'         covariance matrix for multivariate Normal proposal is sigma2*I_R
+  #' I: number of iterations
+  
+  # 1. select initial value
+  z_now <- z_init
+  R = length(z_init)  # dimension
+  # I*R matrix to store all z's obtained in I iterations
+  z_out <- matrix(0, nrow = I, ncol = R)
+  # I*R matrix to store corresponding alpha's
+  alpha_out <- matrix(0, nrow = I, ncol = R)
+  accept_num <- 0  # number of accepted candidates
+  nonpos_z <- 0  # number of non-positive z's not meeting constraints
+  
+  
+  # 2. for i = 1, ..., I, repeat:
+  for (i in 1:I) {
+    # a. draw a candidate from proposal
+    z_cand <- rmvnorm(n = 1, mean = z_now, sigma = diag(sigma2, nrow = R))
+
+    if (all(z_cand > 0)) {  # constraint satisfied
+      # b. acceptance probability
+      # posterior of z^(i-1)
+      posterior_now <- posterior_z(z_now, s)
+      # posterior of candidate z*
+      posterior_cand <- posterior_z(z_cand, s)
+      # acceptance probability
+      P_accept <- min(posterior_cand / posterior_now, 1)
+
+      # c. generate u from U[0,1]
+      u <- runif(1)
+      
+      # d. accept / reject the candidate
+      if (u <= P_accept) {  
+        # if u <= P_accept, accept z_cand and save z^i = z_cand
+        # if u > P_accept, reject z_cand and save z_now
+        z_now <- z_cand
+        accept_num <- accept_num + 1
+        posterior_now <- posterior_cand
+      } 
+    } else {  # constraint not met, reject
+      nonpos_z <- nonpos_z + 1
+    }
+    z_out[i, ] <- z_now  # store z for iteration i
+    alpha_out[i, ] <- z_now / sum(z_now)  # calculate and store alpha
+  }
+  
+  #' return: 
+  #' matrix of z
+  #' matrix of alpha
+  #' acceptance rate over I iterations 
+  #' rate of non-positive z's over I iterations
+  list(z = z_out, alpha = alpha_out, accept_rate = accept_num/I, nonpos_z_rate = nonpos_z/I)
+}
+```
+
+# MH for x
+
+## Prior and posterior of x
+
+```{r bayesian x}
+# prior of x, with each x_rs ~ log(z_rs) (likelihood)
+prior_x <- function(x) {
+  exp(sum(x - exp(x)))
+}
+
+# posterior of x
+posterior_x <- function(x, s) {
+  alpha <- exp(x)/sum(exp(x))
+  model(alpha, s) * prior_x(x)
+}
+```
+
+## Random walk MH algorithm for x
+
+```{r MH x}
+# define a function to sample x using RW M-H algorithm
+MHx <- function(x_init, s, sigma2, I) {
+  #' inputs
+  #' x_init: initial x vector (length = R)
+  #' s: which American region
+  #' sigma2: variance for the elements of candidate x*
+  #'         covariance matrix for multivariate Normal proposal is sigma2*I_R
+  #' I: number of iterations
+  
+  # 1. select initial value
+  x_now <- x_init
+  R = length(x_init)  # dimension
+  # I*R matrix to store all x's obtained in I iterations
+  x_out <- matrix(0, nrow = I, ncol = R)
+  # I*R matrix to store corresponding alpha's
+  alpha_out <- matrix(0, nrow = I, ncol = R)
+  accept_num <- 0  # number of accepted candidates
+  
+  
+  # 2. for i = 1, ..., I, repeat:
+  for (i in 1:I) {
+    # a. draw a candidate from proposal
+    x_cand <- rmvnorm(n = 1, mean = x_now, sigma = diag(sigma2, nrow = R))
+
+    # the only constraint is x being real
+    # b. acceptance probability
+    # posterior of x^(i-1)
+    posterior_now <- posterior_x(x_now, s)
+    # posterior of candidate x*
+    posterior_cand <- posterior_x(x_cand, s)
+    # acceptance probability
+    P_accept <- min(posterior_cand / posterior_now, 1)
+
+    # c. generate u from U[0,1]
+    u <- runif(1)
+    
+    # d. accept / reject the candidate
+    if (u <= P_accept) {  
+      # if u <= P_accept, accept x_cand and save x^i = x_cand
+      # if u > P_accept, reject x_cand and save x_now
+      x_now <- x_cand
+      accept_num <- accept_num + 1
+      posterior_now <- posterior_cand
+    }
+    x_out[i, ] <- x_now  # store x for iteration i
+    alpha_out[i, ] <- exp(x_now)/sum(exp(x_now))  # calculate and store alpha
+  } 
+  
+  #' return: 
+  #' matrix of x
+  #' matrix of alpha
+  #' acceptance rate over I iterations 
+  list(x = x_out, alpha = alpha_out, accept_rate = accept_num/I)
+}
+```
+
+# Rates of MHalpha, MHz, MHx for comparison
+
+```{r rates MH alpha, warning=FALSE}
+alpha_0 <- rdirichlet(1, numeric(R)+1)  # randomly generate initial alpha
+sigma2s <- c(4, 1, 0.1, 0.01, 0.001, 0.0001)  # values of sigma2
+
+# dataframe to store the results
+rates_MHalpha <- data.frame(sigma2 = c(),
+                            accpet_rate = c(),
+                            neg_alpha_rate = c())
+
+# conduct MHa and store the results
+for (i in 1:length(sigma2s)) {
+  sigma2 <- sigma2s[i]
+  output_alpha <- MHalpha(alpha_init = alpha_0, s = 1, sigma2, I = 5000)
+  
+  rates_store <- data.frame(sigma2 = c(sigma2), 
+                            accept_rate = c(output_alpha$accept_rate), 
+                            neg_alpha_rate = c(output_alpha$neg_alpha_rate))
+  
+  rates_MHalpha <- rbind(rates_MHalpha, rates_store)
+}
+
+rates_MHalpha
+```
+
+```{r rates MH z, warning=FALSE}
+z_0 <- rgamma(R, shape = 1, rate = 1)  # randomly generate initial z
+sigma2s <- c(4, 1, 0.1, 0.01, 0.001, 0.0001)  # values of sigma2
+
+# dataframe to store the results
+rates_MHz <- data.frame(sigma2 = c(),
+                        accpet_rate = c(),
+                        nonpos_z_rate = c())
+
+# conduct MHz and store the results
+for (i in 1:length(sigma2s)) {
+  sigma2 <- sigma2s[i]
+  output_z <- MHz(z_init = z_0, s = 1, sigma2, I = 5000)
+  
+  rates_store <- data.frame(sigma2 = c(sigma2), 
+                            accept_rate = c(output_z$accept_rate), 
+                            nonpos_z_rate = c(output_z$nonpos_z_rate))
+  
+  rates_MHz <- rbind(rates_MHz, rates_store)
+}
+
+rates_MHz
+```
+
+```{r rates MH x, warning=FALSE}
+x_0 <- log(rgamma(R, shape = 1, rate = 1))  # randomly generate initial x
+sigma2s <- c(4, 1, 0.1, 0.01, 0.001, 0.0001)  # values of sigma2
+
+# dataframe to store the results
+rates_MHx <- data.frame(sigma2 = c(),
+                        accpet_rate = c())
+
+# conduct MHz and store the results
+for (i in 1:length(sigma2s)) {
+  sigma2 <- sigma2s[i]
+  output_x <- MHx(x_init = x_0, s = 1, sigma2, I = 5000)
+  assign(paste("output_x_", i, sep = ""), output_x)  # assign a name to output
+  
+  rates_store <- data.frame(sigma2 = c(sigma2), 
+                            accept_rate = c(output_x$accept_rate))
+  
+  rates_MHx <- rbind(rates_MHx, rates_store)
+}
+
+rates_MHx
+```
+
+# Optimisation of MH
+## Sample ranges
+
+```{r x ambitious moves}
+# traceplots of samples of x_11
+# sigma2 = 4
+x11_output_1 = mcmc(output_x_1$x[, 1])
+traceplot(x11_output_1, ylab = "x_11", mgp = c(2,1,0))
+# sigma2 = 1
+x11_output_2 = mcmc(output_x_2$x[, 1])
+traceplot(x11_output_2, ylab = "x_11", mgp = c(2,1,0))
+# sigma2 = 0.01
+x11_output_4 = mcmc(output_x_4$x[, 1])
+traceplot(x11_output_4, ylab = "x_11", mgp = c(2,1,0))
+# sigma2 = 0.0001
+x11_output_6 = mcmc(output_x_6$x[, 1])
+traceplot(x11_output_6, ylab = "x_11", mgp = c(2,1,0))
+```
+
+# Adaptive Metropolis algorithm for x
+
+```{r AM x}
+# define a function to sample x using adaptive MH algorithm
+AMx <- function(x_init, s, I, beta) {
+  #' inputs
+  #' x_init: initial x vector (length = R)
+  #' s: which American region
+  #' I: number of iterations
+  #' beta: in proposal for i>2R
+  
+  # 1. select initial value
+  x_now <- x_init
+  R = length(x_init)  # dimension
+  # I*R matrix to store all x's obtained in I iterations
+  x_out <- matrix(0, nrow = I, ncol = R)
+  # I*R matrix to store corresponding alpha's
+  alpha_out <- matrix(0, nrow = I, ncol = R)
+  accept_num <- 0  # number of accepted candidates
+  
+  
+  # 2. for i = 1, ..., I, repeat:
+  for (i in 1:I) {
+    if (i <= 2*R) {  # i <= 2R
+      # a. draw candidate
+      Sigma_0 <- diag(0.1^2/R, nrow = R)  # calculate the covariance matrix 0.1^2*I_R/R 
+      x_cand <- rmvnorm(n = 1, mean = x_now, sigma = Sigma_0)
+      
+      # b. acceptance probability
+      posterior_now <- posterior_x(x_now, s)
+      posterior_cand <- posterior_x(x_cand, s)
+      q_now <- dmvnorm(x_now, mean = x_cand, sigma = diag(0.1^2/R, nrow = R))
+      q_cand <- dmvnorm(x_cand, mean = x_now, sigma = diag(0.1^2/R, nrow = R))
+      P_accept <- min(posterior_cand / posterior_now, 1)
+      
+      # c. generate u from U[0,1]
+      u <- runif(1)
+      
+      # d. accept / reject the candidate
+      if (u <= P_accept) {  
+        x_now <- x_cand
+        accept_num <- accept_num + 1
+        posterior_now <- posterior_cand
+      }
+    } else {  # i > 2R
+      # a. draw candidate
+      Sigma_0 <- diag(0.1^2/R, nrow = R)  # covariance matrix 0.1^2*I_R/R 
+      x_samples_now <- rbind(x_init, x_out[1:i-1, ])  # samples x^0, ..., x^(i-1)
+      Sigma_i <- cov(x_samples_now)  # empirical covariance matrix
+      x_cand <- (1-beta) * rmvnorm(n = 1, mean = x_now, sigma = 2.38^2/R*Sigma_i) + 
+                beta * rmvnorm(n = 1, mean = x_now, sigma = Sigma_0)
+      
+      # b. acceptance probability
+      posterior_now <- posterior_x(x_now, s)
+      posterior_cand <- posterior_x(x_cand, s)
+      #q_now <- (1-beta) * dmvnorm(x_now, mean = x_cand, sigma = 2.38^2/R*Sigma_i) + 
+      #         beta * dmvnorm(x_now, mean = x_cand, sigma = Sigma_0)
+      #q_cand <- (1-beta) * dmvnorm(x_cand, mean = x_now, sigma = 2.38^2/R*Sigma_i) + 
+      #          beta * dmvnorm(x_cand, mean = x_now, sigma = Sigma_0)
+      #P_accept <- min((posterior_cand*q_now) / (posterior_now*q_cand), 1)
+      P_accept <- min(posterior_cand / posterior_now, 1)
+      
+      # c. generate u from U[0,1]
+      u <- runif(1)
+      
+      # d. accept / reject the candidate
+      if (u <= P_accept) {  
+        x_now <- x_cand
+        accept_num <- accept_num + 1
+        posterior_now <- posterior_cand
+      }
+    }
+    x_out[i, ] <- x_now  # store x for iteration i
+    alpha_out[i, ] <- exp(x_now)/sum(exp(x_now))  # calculate and store alpha
+  } 
+  
+  #' return: 
+  #' matrix of x
+  #' matrix of alpha
+  #' acceptance rate over I iterations 
+  list(x = x_out, alpha = alpha_out, accept_rate = accept_num/I)
+}
+```
+
+## Acceptance rates for each s
+
+```{r AM rates, warning=FALSE}
+x_0 <- log(rgamma(R, shape = 1, rate = 1))  # randomly generate initial x
+
+# apply AM for x for all s
+adapt_out_s1 <- AMx(x_init = x_0, s = 1, I = 10000, beta = 0.01)
+adapt_out_s2 <- AMx(x_init = x_0, s = 2, I = 10000, beta = 0.01)
+adapt_out_s3 <- AMx(x_init = x_0, s = 3, I = 10000, beta = 0.01)
+adapt_out_s4 <- AMx(x_init = x_0, s = 4, I = 10000, beta = 0.01)
+
+# dataframe of acceptance rates
+adapt_rates <- data.frame(s = c(1, 2, 3, 4),
+                          accept_rate = c(adapt_out_s1$accept_rate, adapt_out_s2$accept_rate,
+                                          adapt_out_s3$accept_rate, adapt_out_s4$accept_rate))
+
+adapt_rates
+```
+
+## Trace plots for each alpha_rs
+
+```{r AM alpha}
+alpha_s1 <- mcmc(adapt_out_s1$alpha)
+alpha_s2 <- mcmc(adapt_out_s2$alpha)
+alpha_s3 <- mcmc(adapt_out_s3$alpha)
+alpha_s4 <- mcmc(adapt_out_s4$alpha)
+```
+
+```{r alpha traceplot s=1}
+# s=1
+for (i in 1:6) {
+  traceplot(alpha_s1[, i], ylab = c(paste("alpha_", i, "1", sep = "")), mgp = c(2,1,0))
+}
+```
+
+```{r alpha traceplot s=2}
+# s=2
+for (i in 1:6) {
+  traceplot(alpha_s2[, i], ylab = c(paste("alpha_", i, "2", sep = "")), mgp = c(2,1,0))
+}
+```
+
+```{r alpha traceplot s=3}
+# s=3
+for (i in 1:6) {
+  traceplot(alpha_s3[, i], ylab = c(paste("alpha_", i, "3", sep = "")), mgp = c(2,1,0))
+}
+```
+
+```{r alpha traceplot s=4}
+# s=4
+for (i in 1:6) {
+  traceplot(alpha_s4[, i], ylab = c(paste("alpha_", i, "4", sep = "")), mgp = c(2,1,0))
+}
+```
+
+## Sample mean and SD for each burnt alpha_rs
+
+```{r AM alpha burnt summary}
+alpha_burnt_s1 <- mcmc(alpha_s1[2001:10000, ])
+alpha_burnt_s2 <- mcmc(alpha_s2[2001:10000, ])
+alpha_burnt_s3 <- mcmc(alpha_s3[2001:10000, ])
+alpha_burnt_s4 <- mcmc(alpha_s4[2001:10000, ])
+
+print("North America (s = 1)")
+summary(alpha_burnt_s1)
+
+print("Central America (s = 2)")
+summary(alpha_burnt_s2)
+
+print("South America (s = 3)")
+summary(alpha_burnt_s3)
+
+print("Americas (s = 4)")
+summary(alpha_burnt_s4)
+```
+
+## Probability of inferred orders of alpha
+
+```{r probability}
+# probability of alpha2s being max for posterior samples
+prob_alpha2s_max <- function(alpha) {
+  I <- dim(alpha)[1]  # number of samples
+  N <- 0  # number of samples satisfying the results
+  for (i in 1:I) {
+    if (max(alpha[i, ]) == alpha[i, 2]) {
+      N <- N+1
+    }
+  }
+  N/I
+}
+
+# probability of alpha3s being max for posterior samples
+# for s=3
+prob_alpha3s_max <- function(alpha) {
+  I <- dim(alpha)[1]  # number of samples
+  N <- 0  # number of samples satisfying the results
+  for (i in 1:I) {
+    if (max(alpha[i, ]) == alpha[i, 3]) {
+      N <- N+1
+    }
+  }
+  N/I
+}
+
+# probability of alpha1s < alpha6s < alpha4s < alpha5s for posterior samples
+prob_other_alpha <- function(alpha) {
+  I <- dim(alpha)[1]  # number of samples
+  N <- 0  # number of samples satisfying the results
+  for (i in 1:I) {
+    if (alpha[i, 1] < alpha[i, 6] & alpha[i, 6] < alpha[i, 4] & alpha[i, 4] < alpha[i, 5]) {
+      N <- N+1
+    }
+  }
+  N/I
+}
+
+alpha2s_max_probs <- data.frame(s = c(1, 2, 3, 4),
+                                probability_alpha2s_max = c(prob_alpha2s_max(alpha_burnt_s1),
+                                                            prob_alpha2s_max(alpha_burnt_s2),
+                                                            prob_alpha2s_max(alpha_burnt_s3),
+                                                            prob_alpha2s_max(alpha_burnt_s4)))
+alpha3s_max_probs <- data.frame(s = c(1, 2, 3, 4),
+                                probability_alpha3s_max = c(prob_alpha3s_max(alpha_burnt_s1),
+                                                            prob_alpha3s_max(alpha_burnt_s2),
+                                                            prob_alpha3s_max(alpha_burnt_s3),
+                                                            prob_alpha3s_max(alpha_burnt_s4)))
+other_alpha_probs <- data.frame(s = c(1, 2, 3, 4),
+                                probability = c(prob_other_alpha(alpha_burnt_s1),
+                                                prob_other_alpha(alpha_burnt_s2),
+                                                prob_other_alpha(alpha_burnt_s3),
+                                                prob_other_alpha(alpha_burnt_s4)))
+alpha2s_max_probs
+alpha3s_max_probs
+other_alpha_probs
+```
+
+## Trace plots and density plots for each burnt alpha_rs
+
+```{r burnt plot s=1}
+for (i in 1:6) {
+  traceplot(alpha_burnt_s1[, i], ylab = c(paste("alpha_", i, "1", sep = "")), mgp = c(2,1,0))
+  densplot(alpha_burnt_s1[, i], xlab = c(paste("alpha_", i, "1", sep = "")), 
+           ylab = "Density", mgp = c(2,1,0))
+}
+```
+
+```{r burnt plot s=2}
+for (i in 1:6) {
+  traceplot(alpha_burnt_s2[, i], ylab = c(paste("alpha_", i, "2", sep = "")), mgp = c(2,1,0))
+  densplot(alpha_burnt_s2[, i], xlab = c(paste("alpha_", i, "2", sep = "")), 
+           ylab = "Density", mgp = c(2,1,0))
+}
+```
+
+```{r burnt plot s=3}
+for (i in 1:6) {
+  traceplot(alpha_burnt_s3[, i], ylab = c(paste("alpha_", i, "3", sep = "")), mgp = c(2,1,0))
+  densplot(alpha_burnt_s3[, i], xlab = c(paste("alpha_", i, "3", sep = "")), 
+           ylab = "Density", mgp = c(2,1,0))
+}
+```
+
+```{r burnt plot s=4}
+for (i in 1:6) {
+  traceplot(alpha_burnt_s4[, i], ylab = c(paste("alpha_", i, "4", sep = "")), mgp = c(2,1,0))
+  densplot(alpha_burnt_s4[, i], xlab = c(paste("alpha_", i, "4", sep = "")), 
+           ylab = "Density", mgp = c(2,1,0))
+}
+```
+
+## Effective sample size
+
+```{r effective size}
+print("s = 1")
+effectiveSize(alpha_s1)
+
+print("s = 2")
+effectiveSize(alpha_s2)
+
+print("s = 3")
+effectiveSize(alpha_s3)
+
+print("s = 4")
+effectiveSize(alpha_s4)
+```
+
